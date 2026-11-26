@@ -28,8 +28,8 @@ def verificar():
     # 1. Checa se as fontes esperadas estão presentes
     municipios = set(r['municipio'] for r in registros)
     if "Fortaleza" not in municipios:
-        print("AVISO: Nenhum dado de Fortaleza encontrado (bloqueio de WAF documentado).")
-        # Não vai falhar o script por causa do WAF, mas avisa.
+        print("⚠️  AVISO: Nenhum dado de Fortaleza encontrado (bloqueio de WAF documentado).")
+        # Não vamos falhar o script por causa do WAF, mas avisamos.
     
     numeros_macapa = []
 
@@ -85,13 +85,13 @@ def verificar():
     print(f"Total de registros lidos: {len(registros)}")
     
     if erros:
-        print("\n PROBLEMAS ENCONTRADOS:")
+        print("\n❌ PROBLEMAS ENCONTRADOS:")
         for erro in erros:
             print(f" - {erro}")
         print("\nVerificação FALHOU.")
         sys.exit(1)
     else:
-        print("\n Verificação passou! Sem duplicatas, textos legíveis e sem lacunas graves.")
+        print("\n✅ Verificação passou! Sem duplicatas, textos legíveis e sem lacunas graves.")
         sys.exit(0)
 
 if __name__ == "__main__":
