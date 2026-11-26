@@ -2,31 +2,37 @@
 
 ## Como rodar
 1. Instale as dependências: `pip install -r requirements.txt`
-2. Instale as ferramentas de OCR (necessário para Macapá): `sudo apt install tesseract-ocr tesseract-ocr-por poppler-utils`
-3. Execute o coletor passando o intervalo de datas (se omitido, coleta os últimos 60 dias):
-   `python coletor.py --inicio 2026-11-25 --fim 2026-11-25`
-4. Verifique a integridade dos dados:
-   `python verificador.py`
+2. Instale as ferramentas de OCR (Macapá): `sudo apt install tesseract-ocr tesseract-ocr-por poppler-utils`
+3. Execute o coletor: `python coletor.py` (O padrão coleta os últimos 60 dias. Para um período específico, use `--inicio AAAA-MM-DD --fim AAAA-MM-DD`).
+4. Verifique a integridade dos dados: `python verificador.py`
+
+## Intervalo Exato Coletado e Formato
+A entrega foi executada em **26/11/2026**, cobrindo o intervalo exato de **27/09/2026 a 26/11/2026** (60 dias). Foram coletadas **[X] edições** de Macapá (substitua [X] pelo número final).
+**Justificativa do Formato (JSONL):** Escolhi o JSONL (JSON Lines) em vez de CSV. O texto de um Diário Oficial é extenso e contém muitas quebras de linha. No CSV, isso esbarra no limite de 32.767 caracteres por célula do Excel e pode corromper a tabela. O JSONL trata cada linha como um objeto independente, ideal para *streaming*, indexação e integração direta com bancos NoSQL ou APIs de análise.
 
 ## Como cada fonte funciona e o que descobri
-**Macapá:** A página de listagem é feita em PHP/Livewire e contém uma tabela HTML estática. Os links apontam para PDFs no WordPress da prefeitura. Descobri que o servidor bloqueia requisições sem `Referer` (proteção anti-hotlink) e que os PDFs são **imagens escaneadas**. Portanto, o código usa `requests.Session` para pegar os cookies, envia o `Referer` correto e aplica **OCR** (`pytesseract` e `pdf2image`) para extrair o texto das imagens.
-**Fortaleza:** O site foi construído em Next.js (React) e usa uma API interna (`/api/search`) para retornar os resultados. Durante a inspeção, descobri que a prefeitura usa um Web Application Firewall (WAF) da F5 extremamente agressivo. Ele bloqueou até mesmo a inspeção manual no navegador (exigindo captcha silencioso). Conforme as regras do desafio, não tentei burlar a proteção. O código tenta a requisição, detecta que o WAF devolveu uma página HTML com "Sua solicitação foi negada" e registra o bloqueio sem quebrar a execução.
+**Macapá:** A listagem em PHP/Livewire gera uma tabela HTML. Os PDFs ficam no WordPress da prefeitura, mas o servidor exige o cabeçalho `Referer` (proteção anti-hotlink). Descobri que os PDFs são **imagens escaneadas**. O código usa `requests.Session`, envia o `Referer` e aplica **OCR** (`pytesseract`).
+**Fortaleza:** O site em Next.js (React) usa uma API interna (`POST /api/search`). Durante a inspeção, o WAF (F5) bloqueou até o uso manual do DevTools. O código envia o *payload* do mês, mas detecta que o WAF retorna uma página HTML ("Sua solicitação foi negada") no lugar do JSON. Conforme as regras, não tentei burlar a proteção; o script registra o bloqueio e aborta Fortaleza sem quebrar a execução.
+
+## Mapeamento de Tipos
+Em Macapá, o tipo é verificado na coluna de descrição da tabela e no início do texto usando Regex `\bedi[cç][aã]o\s+extra\b`. Isso evita falsos positivos com a palavra "EXTRATO" (comum em contratos). Se não houver menção, assume-se `normal`.
 
 ## Como sei que não faltou edição (Verificação)
-O script `verificador.py` roda sobre o CSV e valida três pilares:
-1. **Duplicatas:** Verifica se a combinação `municipio + numero_edicao + data` é única.
-2. **Qualidade do texto:** Garante que o texto não está vazio, tem um tamanho mínimo de 500 caracteres (para evitar extrações falhas do OCR) e não contém caracteres de substituição (`�`).
-3. **Consistência:** Valida se todas as datas estão no formato ISO correto.
-*Nota:* Para Fortaleza, a completude sequencial não pôde ser validada devido ao bloqueio da fonte.
+O `verificador.py` é implacável e valida cinco pilares:
+1. **Lacunas na numeração:** Ordena as edições de Macapá e acusa se houver saltos numéricos maiores que 3 dias (indicando feriados/fins de semana).
+2. **Qualidade do texto:** Garante tamanho mínimo de 500 caracteres e ausência de caracteres ilegíveis (`�`).
+3. **Duplicatas:** Usa a chave `município + número + data + tipo`, evitando conflitos entre edições normais e extras no mesmo dia.
+4. **Consistência:** Valida se o tipo está no dicionário permitido, se a URL é válida e se a data/hora estão em ISO 8601.
+5. **Presença de Fontes:** Emite alerta se a lista de Fortaleza estiver vazia.
 
 ## O que ficou de fora e o que faria com mais tempo
-Ficou de fora o uso de navegadores headless (como Playwright) para tentar contornar o WAF do Fortaleza, pois o edital veda burlar proteções. Com mais tempo, eu implementaria um cruzamento de dados (validação cruzada) comparando os números das edições coletadas de Macapá com a API pública do projeto Querido Diário, garantindo completude por uma fonte terceira.
+Não usei navegadores headless (Playwright) para burlar o WAF do Fortaleza. Com mais tempo, solicitaria acesso à API via LAI (Lei de Acesso à Informação) ou cruzaria os dados com o projeto Querido Diário. Em Macapá, não implementei o OSD (detecção de orientação), o que faria com que páginas horizontais fossem lidas com erros pelo OCR.
 
 ## O que quebraria primeiro se a fonte mudasse
-Em Macapá, o que quebraria primeiro seria o seletor CSS da tabela (se mudarem as classes) ou o padrão de nome da URL do PDF. O OCR continuaria funcionando se o layout do PDF mudasse, mas a qualidade do texto poderia cair.
+Em Macapá, quebraria o seletor CSS da tabela ou a mudança na regra do `Referer`. No Fortaleza, qualquer alteração no *payload* da API ou a introdução de um captcha real (reCAPTCHA v3) impediria o acesso.
 
-## Qual é a parte mais frágil do código e por quê
-A extração de texto via OCR em Macapá. Como os PDFs são fotos do diário impresso, a qualidade do texto extraído depende da qualidade do escaneamento. O OCR pode cometer erros de português (ex: ler "Município" como "Muncípio"), o que é aceitável para busca, mas exigiria um pós-processamento ou um OCR mais avançado (como o Google Cloud Vision) em um ambiente de produção.
+## Qual é a parte mais frágil do seu código e por quê
+O OCR em Macapá. Como os PDFs são fotos do diário impresso, a qualidade do texto depende do escaneamento. O Tesseract pode falhar em páginas rotacionadas ou gerar erros ortográficos leves (ex: "Município" como "Muncípio"). O verificador pega textos vazios, mas não erros ortográficos.
 
 ## Como usei IA
-A IA foi usada para gerar o esqueleto inicial do `requests` e a estrutura da verificação. Eu precisei intervir em três pontos principais: 1) Descobrir e adicionar o cabeçalho `Referer` para o Macapá funcionar; 2) Implementar a lógica de fallback para OCR, que a IA inicialmente não previu; 3) Ajustar o tratamento do WAF do Fortaleza para que o script não quebrasse ao receber um HTML no lugar de um JSON.
+A IA gerou o esqueleto do `requests` e a estrutura base da verificação. Eu precisei intervir em cinco pontos: 1) Adicionar o `Referer` no Macapá; 2) Implementar o *fallback* para OCR; 3) Tratar o "Falso 200" do WAF do Fortaleza; 4) Corrigir o falso positivo de "EXTRATO" com Regex; 5) Migrar o formato de saída de CSV para JSONL para evitar limites de célula e facilitar a indexação.
