@@ -1,12 +1,18 @@
+import io
+import json
+import re
+import time
+from datetime import datetime
+from urllib.parse import urljoin
+
+import pdfplumber
+import pytesseract
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
-import time
-import io
-import pdfplumber
 from pdf2image import convert_from_bytes
-import pytesseract
-import re
+
+
+URL_BASE = "https://macapa.ap.gov.br/diarios-oficiais/"
 
 
 def extrair_texto_pdf(conteudo_pdf):
@@ -18,116 +24,234 @@ def extrair_texto_pdf(conteudo_pdf):
             if texto_pagina:
                 texto += texto_pagina + "\n"
 
-    # 2. Se não extraiu nada, é porque é escaneado. Usa OCR.
+    # 2. Se não extraiu texto suficiente, aplica OCR
     if len(texto.strip()) < 50:
         print("  -> PDF escaneado detectado. Aplicando OCR (pode demorar um pouco)...")
         imagens = convert_from_bytes(conteudo_pdf, dpi=200)
         texto = ""
-        for i, imagem in enumerate(imagens):
+        for imagem in imagens:
             texto_pagina = pytesseract.image_to_string(imagem, lang="por")
             texto += texto_pagina + "\n"
 
     return texto
 
 
-def coletar_macapa(data_inicio, data_fim):
-    url_base = "https://macapa.ap.gov.br/diarios-oficiais/"
-    print(f"Acessando {url_base}...")
+def _desempacotar_livewire(valor):
+    """Remove o envelope [valor, {"s": "..."}] usado nos snapshots do Livewire v3."""
+    if (
+        isinstance(valor, list)
+        and len(valor) == 2
+        and isinstance(valor[1], dict)
+        and "s" in valor[1]
+    ):
+        return _desempacotar_livewire(valor[0])
+    if isinstance(valor, list):
+        return [_desempacotar_livewire(v) for v in valor]
+    if isinstance(valor, dict):
+        return {k: _desempacotar_livewire(v) for k, v in valor.items()}
+    return valor
 
-    session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+
+def _listar_meses_no_intervalo(data_inicio, data_fim):
+    """Retorna lista de (ano, mes) do mais recente ao mais antigo dentro do intervalo."""
+    meses = []
+    ano, mes = data_fim.year, data_fim.month
+    while (ano, mes) >= (data_inicio.year, data_inicio.month):
+        meses.append((ano, mes))
+        mes -= 1
+        if mes == 0:
+            mes = 12
+            ano -= 1
+    return meses
+
+
+def _chamar_livewire(session, url_update, csrf_token, snapshot_str, metodo, params):
+    payload = {
+        "_token": csrf_token,
+        "components": [
+            {
+                "snapshot": snapshot_str,
+                "updates": {},
+                "calls": [
+                    {
+                        "path": "",
+                        "method": metodo,
+                        "params": params,
+                    }
+                ],
+            }
+        ],
     }
-    session.headers.update(headers)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Livewire": "true",
+        "X-CSRF-TOKEN": csrf_token,
+        "Referer": URL_BASE,
+        "Origin": "https://macapa.ap.gov.br",
+    }
+    resp = session.post(url_update, json=payload, headers=headers, timeout=30)
+    resp.raise_for_status()
+    dados_resp = resp.json()
+    return dados_resp["components"][0]["snapshot"]
 
-    try:
-        resposta = session.get(url_base, timeout=30)
-        resposta.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"Erro ao acessar a página principal: {e}")
-        return []
+
+def listar_edicoes_macapa(session, data_inicio, data_fim):
+    """Consulta o componente Livewire mês a mês e retorna as edições dentro do intervalo."""
+    resposta = session.get(URL_BASE, timeout=30)
+    resposta.raise_for_status()
 
     soup = BeautifulSoup(resposta.text, "html.parser")
-    tabela = soup.find("table")
 
-    if not tabela:
-        print("ERRO: Tabela não encontrada na página.")
-        return []
+    script_lw = soup.find("script", attrs={"data-csrf": True})
+    comp_lw = soup.find(attrs={"wire:snapshot": True})
 
-    # Nota: Se o site tiver paginação (botão 'Próxima'), precisaríamos iterar por ela.
-    # Como o print mostrou as edições mais recentes, assumimos que a tabela carrega o período desejado.
-    linhas = tabela.find("tbody").find_all("tr")
-    registros = []
+    if not script_lw or not comp_lw:
+        raise RuntimeError(
+            "Componente Livewire ou token CSRF não encontrado na página."
+        )
 
-    for linha in linhas:
-        colunas = linha.find_all("td")
-        if len(colunas) < 4:
-            continue
+    csrf_token = script_lw["data-csrf"]
+    url_update = urljoin(URL_BASE, script_lw.get("data-update-uri", "/livewire/update"))
+    snapshot_str = comp_lw["wire:snapshot"]
+    snapshot_data = json.loads(snapshot_str)["data"]
 
-        numero_edicao = colunas[0].text.strip()
-        data_str = colunas[1].text.strip()
+    ano_atual = str(snapshot_data.get("year", ""))
+    mes_atual = str(snapshot_data.get("month", "")).zfill(2)
 
-        try:
-            data_publicacao = datetime.strptime(data_str, "%d/%m/%Y").date()
-        except ValueError:
-            continue
+    edicoes_filtradas = []
+    urls_vistas = set()
 
-        if data_inicio <= data_publicacao <= data_fim:
-            link_tag = colunas[3].find("a")
-            if not link_tag:
+    for ano, mes in _listar_meses_no_intervalo(data_inicio, data_fim):
+        ano_str = str(ano)
+        mes_str = f"{mes:02d}"
+
+        if ano_str != ano_atual:
+            print(f"Consultando ano {ano_str} no portal...")
+            snapshot_str = _chamar_livewire(
+                session, url_update, csrf_token, snapshot_str, "changeYear", [ano_str]
+            )
+            snapshot_data = json.loads(snapshot_str)["data"]
+            ano_atual = str(snapshot_data.get("year", ano_str))
+            mes_atual = str(snapshot_data.get("month", "")).zfill(2)
+            time.sleep(0.5)
+
+        if mes_str != mes_atual:
+            print(f"Consultando mês {mes_str}/{ano_str} no portal...")
+            snapshot_str = _chamar_livewire(
+                session, url_update, csrf_token, snapshot_str, "setMonth", [mes_str]
+            )
+            snapshot_data = json.loads(snapshot_str)["data"]
+            ano_atual = str(snapshot_data.get("year", ano_str))
+            mes_atual = str(snapshot_data.get("month", mes_str)).zfill(2)
+            time.sleep(0.5)
+
+        diarios_mes = _desempacotar_livewire(snapshot_data.get("tabDiaries", []))
+
+        for diario in diarios_mes:
+            if not isinstance(diario, dict):
                 continue
 
-            url_pdf = link_tag.get("href")
-            print(f"Baixando edição {numero_edicao} de {data_str}...")
+            numero_edicao = str(diario.get("id", "")).strip()
+            data_str = str(diario.get("date", "")).strip()
+            titulo = str(diario.get("title", "")).strip()
+            url_pdf = str(diario.get("link", "")).strip()
+
+            if not url_pdf or url_pdf in urls_vistas:
+                continue
 
             try:
-                headers_pdf = {"Referer": url_base}
-                resp_pdf = session.get(url_pdf, headers=headers_pdf, timeout=60)
-                resp_pdf.raise_for_status()
+                data_publicacao = datetime.strptime(data_str, "%d/%m/%Y").date()
+            except ValueError:
+                continue
 
-                if not resp_pdf.content.startswith(b"%PDF"):
-                    print(
-                        f"  -> BLOQUEADO! O servidor não retornou um PDF para a edição {numero_edicao}."
-                    )
-                    continue
-
-                texto_completo = extrair_texto_pdf(resp_pdf.content)
-
-                # Mapeamento de Tipo (Corrigido para evitar falso positivo de "EXTRATO")
-                tipo = "normal"
-                coluna_descricao = colunas[2].text.lower()
-
-                if "extra" in coluna_descricao or re.search(
-                    r"\bedi[cç][aã]o\s+extra(ordin[aá]ria)?\b",
-                    texto_completo[:1000],
-                    re.I,
-                ):
-                    tipo = "extra"
-                elif "suplemento" in coluna_descricao or re.search(
-                    r"\bsuplemento\b", texto_completo[:1000], re.I
-                ):
-                    tipo = "suplemento"
-
-                registros.append(
+            if data_inicio <= data_publicacao <= data_fim:
+                urls_vistas.add(url_pdf)
+                edicoes_filtradas.append(
                     {
-                        "municipio": "Macapá",
-                        "data_publicacao": data_publicacao.isoformat(),
                         "numero_edicao": numero_edicao,
-                        "tipo": tipo,
-                        "url_documento": url_pdf,
-                        "texto_completo": texto_completo,
-                        "coletado_em": datetime.now().astimezone().isoformat(),
+                        "data_str": data_str,
+                        "data_publicacao": data_publicacao,
+                        "titulo": titulo,
+                        "url_pdf": url_pdf,
                     }
                 )
+
+    return edicoes_filtradas
+
+
+def coletar_macapa(data_inicio, data_fim):
+    print(f"Acessando {URL_BASE}...")
+
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+    )
+
+    try:
+        edicoes = listar_edicoes_macapa(session, data_inicio, data_fim)
+    except Exception as e:
+        print(f"Erro ao listar edições de Macapá: {e}")
+        return []
+
+    print(f"Total de edições encontradas no período: {len(edicoes)}")
+    registros = []
+
+    for edicao in edicoes:
+        numero_edicao = edicao["numero_edicao"]
+        data_str = edicao["data_str"]
+        data_publicacao = edicao["data_publicacao"]
+        titulo = edicao["titulo"]
+        url_pdf = edicao["url_pdf"]
+
+        print(f"Baixando edição {numero_edicao} de {data_str}...")
+
+        try:
+            resp_pdf = session.get(url_pdf, headers={"Referer": URL_BASE}, timeout=60)
+            resp_pdf.raise_for_status()
+
+            if not resp_pdf.content.startswith(b"%PDF"):
                 print(
-                    f"  -> Sucesso! {len(texto_completo)} caracteres extraídos (Tipo: {tipo})."
+                    f"  -> BLOQUEADO! O servidor não retornou um PDF para a edição {numero_edicao}."
                 )
+                continue
 
-                time.sleep(2)
+            texto_completo = extrair_texto_pdf(resp_pdf.content)
 
-            except Exception as e:
-                print(f"  -> Erro ao baixar/ler o PDF {numero_edicao}: {e}")
+            tipo = "normal"
+            if re.search(r"\bextra(ordin[aá]ri[ao])?\b", titulo, re.I) or re.search(
+                r"\bedi[cç][aã]o\s+extra(ordin[aá]ria)?\b",
+                texto_completo[:1000],
+                re.I,
+            ):
+                tipo = "extra"
+            elif re.search(r"\bsuplemento\b", titulo, re.I) or re.search(
+                r"\bsuplemento\b", texto_completo[:1000], re.I
+            ):
+                tipo = "suplemento"
+
+            registros.append(
+                {
+                    "municipio": "Macapá",
+                    "data_publicacao": data_publicacao.isoformat(),
+                    "numero_edicao": numero_edicao,
+                    "tipo": tipo,
+                    "url_documento": url_pdf,
+                    "texto_completo": texto_completo,
+                    "coletado_em": datetime.now().astimezone().isoformat(),
+                }
+            )
+            print(
+                f"  -> Sucesso! {len(texto_completo)} caracteres extraídos (Tipo: {tipo})."
+            )
+
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"  -> Erro ao baixar/ler o PDF {numero_edicao}: {e}")
 
     return registros
