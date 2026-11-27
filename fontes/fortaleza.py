@@ -1,57 +1,62 @@
+import time
 import requests
 
 
-def coletar_fortaleza(data_inicio, data_fim):
-    print("Acessando a API do Fortaleza...")
-    url_api = "https://diariooficial.fortaleza.ce.gov.br/api/search"
+URL_HOME = "https://diariooficial.fortaleza.ce.gov.br/"
+URL_API = "https://diariooficial.fortaleza.ce.gov.br/api/search"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "Origin": "https://diariooficial.fortaleza.ce.gov.br",
-        "Referer": "https://diariooficial.fortaleza.ce.gov.br/",
-    }
+
+def coletar_fortaleza(data_inicio, data_fim):
+    print("Acessando a API de Fortaleza...")
 
     session = requests.Session()
-    session.headers.update(headers)
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": "https://diariooficial.fortaleza.ce.gov.br",
+            "Referer": URL_HOME,
+        }
+    )
 
-    # Gera a lista de meses (ex: (2026, 9), (2026, 10), (2026, 11))
-    meses_busca = set()
+    meses_busca = []
     ano, mes = data_inicio.year, data_inicio.month
     while (ano, mes) <= (data_fim.year, data_fim.month):
-        meses_busca.add((ano, mes))
+        meses_busca.append((ano, mes))
         mes += 1
         if mes > 12:
             mes = 1
             ano += 1
 
     try:
-        session.get("https://diariooficial.fortaleza.ce.gov.br/", timeout=30)
+        resp_home = session.get(URL_HOME, timeout=30)
+        if (
+            resp_home.status_code != 200
+            or "solicitação foi negada" in resp_home.text.lower()
+        ):
+            print(
+                f"AVISO: Acesso inicial a Fortaleza bloqueado (HTTP {resp_home.status_code}). Abortando Fortaleza."
+            )
+            return []
 
-        for ano_busca, mes_busca in sorted(meses_busca):
-            print(f"Tentando buscar diários de {mes_busca:02d}/{ano_busca}...")
-
+        for ano_busca, mes_busca in meses_busca:
+            print(f"Buscando diários de {mes_busca:02d}/{ano_busca}...")
             payload = {"ano": ano_busca, "mes": mes_busca}
-            resposta = session.post(url_api, json=payload, timeout=30)
-
-            # Detecção do WAF (F5)
+            resposta = session.post(URL_API, json=payload, timeout=30)
             content_type = resposta.headers.get("Content-Type", "")
-            if "text/html" in content_type:
-                print(" AVISO: WAF do Fortaleza bloqueou a requisição.")
-                print(" A resposta veio como HTML ('Sua solicitação foi negada').")
+
+            if resposta.status_code != 200 or "text/html" in content_type.lower():
+                print(
+                    f"AVISO: WAF (F5) de Fortaleza bloqueou a requisição "
+                    f"(HTTP {resposta.status_code}, Content-Type: {content_type})."
+                )
                 print(
                     "Conforme as regras do desafio, não tentaremos burlar a proteção. Abortando Fortaleza."
                 )
-                break  # Interrompe o loop, pois o WAF bloqueou todas as chamadas
+                break
 
-            # Se passou, tenta ler o JSON (Só rodaria se o WAF não bloqueasse)
-            if resposta.status_code == 200:
-                dados = resposta.json()
-                # Aqui entraria o parse do JSON e download dos PDFs via 'api/nodes/...'
-                print(
-                    "Sucesso ao obter JSON! (Código para ler JSON não implementado pois foi bloqueado no teste)."
-                )
+            time.sleep(1)
 
         return []
 

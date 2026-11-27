@@ -17,7 +17,6 @@ URL_BASE = "https://macapa.ap.gov.br/diarios-oficiais/"
 
 
 def extrair_texto_pdf(conteudo_pdf):
-    # Tenta extrair texto via pdfplumber (PDFs digitais)
     texto_partes = []
     with pdfplumber.open(io.BytesIO(conteudo_pdf)) as pdf:
         total_paginas = len(pdf.pages)
@@ -27,9 +26,10 @@ def extrair_texto_pdf(conteudo_pdf):
                 texto_partes.append(texto_pagina)
 
     texto = "\n".join(texto_partes)
+    media_por_pagina = len(texto.strip()) / max(total_paginas, 1)
 
-    # Se não extraiu texto suficiente, aplica OCR em lotes pequenos (baixo uso de RAM)
-    if len(texto.strip()) < 50:
+    # Aplica OCR em lotes pequenos se a média de texto por página indicar PDF escaneado
+    if media_por_pagina < 50:
         print(f"  -> PDF escaneado detectado ({total_paginas} págs). Aplicando OCR...")
         texto_partes = []
         tamanho_lote = 5
@@ -49,8 +49,9 @@ def extrair_texto_pdf(conteudo_pdf):
                 )
                 for imagem in imagens:
                     try:
-                        texto_pagina = pytesseract.image_to_string(imagem, lang="por")
-                        texto_partes.append(texto_pagina)
+                        texto_partes.append(
+                            pytesseract.image_to_string(imagem, lang="por")
+                        )
                     finally:
                         imagem.close()
 
@@ -95,13 +96,7 @@ def _chamar_livewire(session, url_update, csrf_token, snapshot_str, metodo, para
             {
                 "snapshot": snapshot_str,
                 "updates": {},
-                "calls": [
-                    {
-                        "path": "",
-                        "method": metodo,
-                        "params": params,
-                    }
-                ],
+                "calls": [{"path": "", "method": metodo, "params": params}],
             }
         ],
     }
@@ -115,8 +110,20 @@ def _chamar_livewire(session, url_update, csrf_token, snapshot_str, metodo, para
     }
     resp = session.post(url_update, json=payload, headers=headers, timeout=30)
     resp.raise_for_status()
-    dados_resp = resp.json()
-    return dados_resp["components"][0]["snapshot"]
+    return resp.json()["components"][0]["snapshot"]
+
+
+def _identificar_tipo(titulo, texto_completo):
+    cabecalho = texto_completo[:500]
+    if re.search(r"\bextra(ordin[aá]ri[ao])?\b", titulo, re.I) or re.search(
+        r"\bedi[cç][aã]o\s+extra(ordin[aá]ria)?\b", cabecalho, re.I
+    ):
+        return "extra"
+    if re.search(r"\bsuplement(o|ar)\b", titulo, re.I) or re.search(
+        r"\b(edi[cç][aã]o\s+suplementar|suplemento)\b", cabecalho, re.I
+    ):
+        return "suplemento"
+    return "normal"
 
 
 def listar_edicoes_macapa(session, data_inicio, data_fim):
@@ -125,7 +132,6 @@ def listar_edicoes_macapa(session, data_inicio, data_fim):
     resposta.raise_for_status()
 
     soup = BeautifulSoup(resposta.text, "html.parser")
-
     script_lw = soup.find("script", attrs={"data-csrf": True})
     comp_lw = soup.find(attrs={"wire:snapshot": True})
 
@@ -248,18 +254,7 @@ def coletar_macapa(data_inicio, data_fim, urls_existentes=None):
                 continue
 
             texto_completo = extrair_texto_pdf(resp_pdf.content)
-
-            tipo = "normal"
-            if re.search(r"\bextra(ordin[aá]ri[ao])?\b", titulo, re.I) or re.search(
-                r"\bedi[cç][aã]o\s+extra(ordin[aá]ria)?\b",
-                texto_completo[:1000],
-                re.I,
-            ):
-                tipo = "extra"
-            elif re.search(r"\bsuplemento\b", titulo, re.I) or re.search(
-                r"\bsuplemento\b", texto_completo[:1000], re.I
-            ):
-                tipo = "suplemento"
+            tipo = _identificar_tipo(titulo, texto_completo)
 
             registro = {
                 "municipio": "Macapá",
