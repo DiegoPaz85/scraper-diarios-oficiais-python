@@ -1,6 +1,7 @@
 import io
 import json
 import re
+import tempfile
 import time
 from datetime import datetime
 from urllib.parse import urljoin
@@ -9,29 +10,51 @@ import pdfplumber
 import pytesseract
 import requests
 from bs4 import BeautifulSoup
-from pdf2image import convert_from_bytes
+from pdf2image import convert_from_path
 
 
 URL_BASE = "https://macapa.ap.gov.br/diarios-oficiais/"
 
 
 def extrair_texto_pdf(conteudo_pdf):
-    # 1. Tenta extrair texto via pdfplumber (PDFs digitais)
-    texto = ""
+    # Tenta extrair texto via pdfplumber (PDFs digitais)
+    texto_partes = []
     with pdfplumber.open(io.BytesIO(conteudo_pdf)) as pdf:
+        total_paginas = len(pdf.pages)
         for pagina in pdf.pages:
             texto_pagina = pagina.extract_text()
             if texto_pagina:
-                texto += texto_pagina + "\n"
+                texto_partes.append(texto_pagina)
 
-    # 2. Se não extraiu texto suficiente, aplica OCR
+    texto = "\n".join(texto_partes)
+
+    # Se não extraiu texto suficiente, aplica OCR em lotes pequenos (baixo uso de RAM)
     if len(texto.strip()) < 50:
-        print("  -> PDF escaneado detectado. Aplicando OCR (pode demorar um pouco)...")
-        imagens = convert_from_bytes(conteudo_pdf, dpi=200)
-        texto = ""
-        for imagem in imagens:
-            texto_pagina = pytesseract.image_to_string(imagem, lang="por")
-            texto += texto_pagina + "\n"
+        print(f"  -> PDF escaneado detectado ({total_paginas} págs). Aplicando OCR...")
+        texto_partes = []
+        tamanho_lote = 5
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+            tmp.write(conteudo_pdf)
+            tmp.flush()
+
+            for inicio in range(1, total_paginas + 1, tamanho_lote):
+                fim = min(inicio + tamanho_lote - 1, total_paginas)
+                imagens = convert_from_path(
+                    tmp.name,
+                    dpi=150,
+                    first_page=inicio,
+                    last_page=fim,
+                    grayscale=True,
+                )
+                for imagem in imagens:
+                    try:
+                        texto_pagina = pytesseract.image_to_string(imagem, lang="por")
+                        texto_partes.append(texto_pagina)
+                    finally:
+                        imagem.close()
+
+        texto = "\n".join(texto_partes)
 
     return texto
 
@@ -180,7 +203,8 @@ def listar_edicoes_macapa(session, data_inicio, data_fim):
     return edicoes_filtradas
 
 
-def coletar_macapa(data_inicio, data_fim):
+def coletar_macapa(data_inicio, data_fim, urls_existentes=None):
+    urls_existentes = urls_existentes or set()
     print(f"Acessando {URL_BASE}...")
 
     session = requests.Session()
@@ -196,10 +220,9 @@ def coletar_macapa(data_inicio, data_fim):
         edicoes = listar_edicoes_macapa(session, data_inicio, data_fim)
     except Exception as e:
         print(f"Erro ao listar edições de Macapá: {e}")
-        return []
+        return
 
     print(f"Total de edições encontradas no período: {len(edicoes)}")
-    registros = []
 
     for edicao in edicoes:
         numero_edicao = edicao["numero_edicao"]
@@ -207,6 +230,10 @@ def coletar_macapa(data_inicio, data_fim):
         data_publicacao = edicao["data_publicacao"]
         titulo = edicao["titulo"]
         url_pdf = edicao["url_pdf"]
+
+        if url_pdf in urls_existentes:
+            print(f"Pulando edição {numero_edicao} de {data_str} (já coletada).")
+            continue
 
         print(f"Baixando edição {numero_edicao} de {data_str}...")
 
@@ -234,24 +261,21 @@ def coletar_macapa(data_inicio, data_fim):
             ):
                 tipo = "suplemento"
 
-            registros.append(
-                {
-                    "municipio": "Macapá",
-                    "data_publicacao": data_publicacao.isoformat(),
-                    "numero_edicao": numero_edicao,
-                    "tipo": tipo,
-                    "url_documento": url_pdf,
-                    "texto_completo": texto_completo,
-                    "coletado_em": datetime.now().astimezone().isoformat(),
-                }
-            )
+            registro = {
+                "municipio": "Macapá",
+                "data_publicacao": data_publicacao.isoformat(),
+                "numero_edicao": numero_edicao,
+                "tipo": tipo,
+                "url_documento": url_pdf,
+                "texto_completo": texto_completo,
+                "coletado_em": datetime.now().astimezone().isoformat(),
+            }
             print(
                 f"  -> Sucesso! {len(texto_completo)} caracteres extraídos (Tipo: {tipo})."
             )
+            yield registro
 
             time.sleep(2)
 
         except Exception as e:
             print(f"  -> Erro ao baixar/ler o PDF {numero_edicao}: {e}")
-
-    return registros
