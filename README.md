@@ -1,38 +1,44 @@
 # Coleta de Diários Oficiais Municipais — Macapá e Fortaleza
 
 ## Como rodar
-1. Instale as dependências: `pip install -r requirements.txt`
-2. Instale as ferramentas de OCR (Macapá): `sudo apt install tesseract-ocr tesseract-ocr-por poppler-utils`
-3. Execute o coletor: `python coletor.py` (O padrão coleta os últimos 60 dias. Para um período específico, use `--inicio AAAA-MM-DD --fim AAAA-MM-DD`).
-4. Verifique a integridade dos dados: `python verificador.py`
+1. Instale as dependências Python: `pip install -r requirements.txt`
+2. Instale as dependências de sistema para OCR (Linux/Ubuntu):
+   `sudo apt install tesseract-ocr tesseract-ocr-por poppler-utils`
+3. Execute o coletor (padrão: últimos 60 dias):
+   `python coletor.py --inicio 2026-09-27 --fim 2026-11-26 --limpar`
+4. Execute a verificação completa (acusa a ausência de Fortaleza com código de saída 1):
+   `python verificador.py --inicio 2026-09-27 --fim 2026-11-26`
+   Para validar isoladamente a integridade de Macapá:
+   `python verificador.py --inicio 2026-09-27 --fim 2026-11-26 --ignorar-fortaleza`
 
-## Intervalo Exato Coletado e Formato
-A entrega foi executada em **26/11/2026**, cobrindo o intervalo exato de **27/09/2026 a 26/11/2026** (60 dias). Foram coletadas **[X] edições** de Macapá (substitua [X] pelo número final).
-**Justificativa do Formato (JSONL):** Escolhi o JSONL (JSON Lines) em vez de CSV. O texto de um Diário Oficial é extenso e contém muitas quebras de linha. No CSV, isso esbarra no limite de 32.767 caracteres por célula do Excel e pode corromper a tabela. O JSONL trata cada linha como um objeto independente, ideal para *streaming*, indexação e integração direta com bancos NoSQL ou APIs de análise.
+## Intervalo coletado, formato e mapeamento de tipos
+A coleta foi executada em **26/11/2026**, cobrindo o intervalo de **27/09/2026 a 26/11/2026** (60 dias). Foram coletadas **40 edições** de Macapá (edições **5383** a **5422**, publicadas entre 28/09/2026 e 26/11/2026, todas classificadas como `normal`) e **0** de Fortaleza (bloqueio de WAF detalhado abaixo).
+
+**Formato (JSONL):** Escolhi JSONL porque diários oficiais contêm textos extensos com múltiplas quebras de linha. Em CSV, isso ultrapassa facilmente limites de ferramentas de planilha e dificulta escape; JSONL permite gravação incremental (*append* seguro em caso de interrupção) e leitura linha a linha pronta para indexação.
+
+**Mapeamento de tipos:** Em Macapá, o tipo é inferido pelo campo `title` retornado pelo portal e pelos primeiros 500 caracteres do texto extraído: expressões de edição extra/extraordinária viram `extra` (usando limites de palavra `\b` para não confundir com "extrato" de contratos), menções a suplemento viram `suplemento`, e o restante é classificado como `normal`.
 
 ## Como cada fonte funciona e o que descobri
-**Macapá:** A listagem em PHP/Livewire gera uma tabela HTML. Os PDFs ficam no WordPress da prefeitura, mas o servidor exige o cabeçalho `Referer` (proteção anti-hotlink). Descobri que os PDFs são **imagens escaneadas**. O código usa `requests.Session`, envia o `Referer` e aplica **OCR** (`pytesseract`).
-**Fortaleza:** O site em Next.js (React) usa uma API interna (`POST /api/search`). Durante a inspeção, o WAF (F5) bloqueou até o uso manual do DevTools. O código envia o *payload* do mês, mas detecta que o WAF retorna uma página HTML ("Sua solicitação foi negada") no lugar do JSON. Conforme as regras, não tentei burlar a proteção; o script registra o bloqueio e aborta Fortaleza sem quebrar a execução.
+**Macapá:** O portal usa Laravel/Livewire v3 e carrega inicialmente apenas o mês corrente. Os dados das edições vêm serializados no atributo `wire:snapshot` (`tabDiaries`), dentro do envelope interno `[valor, {"s": "..."}]`. Para cobrir 60 dias, o coletor extrai o token CSRF e chama `POST /livewire/update` (`changeYear` e `setMonth`) mês a mês. Os PDFs ficam hospedados no WordPress da prefeitura, exigem cabeçalho `Referer` (proteção anti-hotlink) e são majoritariamente imagens escaneadas. O extrator tenta `pdfplumber` primeiro e aplica OCR via Tesseract em lotes de 5 páginas (150 DPI, escala de cinza) quando a média cai abaixo de 50 caracteres por página.
 
-## Mapeamento de Tipos
-Em Macapá, o tipo é verificado na coluna de descrição da tabela e no início do texto usando Regex `\bedi[cç][aã]o\s+extra\b`. Isso evita falsos positivos com a palavra "EXTRATO" (comum em contratos). Se não houver menção, assume-se `normal`.
+**Fortaleza:** O portal em Next.js consulta `POST /api/search` por ano e mês. Durante a investigação — inclusive em acesso manual com DevTools — o WAF F5 BIG-IP bloqueou as chamadas retornando HTTP 200 com `Content-Type: text/html` ("Sua solicitação foi negada"). Seguindo as regras do desafio, não tentei burlar a proteção: o coletor detecta o bloqueio, registra o diagnóstico e encerra a fonte sem interromper Macapá.
 
-## Como sei que não faltou edição (Verificação)
-O `verificador.py` é implacável e valida cinco pilares:
-1. **Lacunas na numeração:** Ordena as edições de Macapá e acusa se houver saltos numéricos maiores que 3 dias (indicando feriados/fins de semana).
-2. **Qualidade do texto:** Garante tamanho mínimo de 500 caracteres e ausência de caracteres ilegíveis (`�`).
-3. **Duplicatas:** Usa a chave `município + número + data + tipo`, evitando conflitos entre edições normais e extras no mesmo dia.
-4. **Consistência:** Valida se o tipo está no dicionário permitido, se a URL é válida e se a data/hora estão em ISO 8601.
-5. **Presença de Fontes:** Emite alerta se a lista de Fortaleza estiver vazia.
+## Como sei que não faltou nenhuma edição
+O `verificador.py` encerra com erro (`exit 1`) diante de qualquer inconsistência:
+1. **Completude por fonte:** falha por padrão se Macapá ou Fortaleza não tiverem registros.
+2. **Sequência numérica:** como a numeração do diário não pula em fins de semana ou feriados, qualquer lacuna entre o menor e o maior número coletado dispara erro.
+3. **Cobertura temporal:** valida se todas as datas estão dentro de `--inicio`/`--fim` e se não há lacuna maior que 7 dias nas bordas do intervalo.
+4. **Duplicatas e metadados:** rejeita URLs repetidas, chaves `município + número + data + tipo` duplicadas, tipos inválidos ou `coletado_em` sem fuso horário ISO 8601.
+5. **Legibilidade:** exige no mínimo 500 caracteres, ausência de `\ufffd`/`\x00` e ao menos 55% de caracteres alfanuméricos.
 
 ## O que ficou de fora e o que faria com mais tempo
-Não usei navegadores headless (Playwright) para burlar o WAF do Fortaleza. Com mais tempo, solicitaria acesso à API via LAI (Lei de Acesso à Informação) ou cruzaria os dados com o projeto Querido Diário. Em Macapá, não implementei o OSD (detecção de orientação), o que faria com que páginas horizontais fossem lidas com erros pelo OCR.
+Não usei automação de navegador para contornar o WAF de Fortaleza; em produção, solicitaria acesso institucional via LAI ou avaliaria fontes espelho (como o Querido Diário). Em Macapá, não implementei detecção automática de rotação de página (OSD) antes do OCR nem comparação direta entre a contagem exibida no portal e o total baixado.
 
 ## O que quebraria primeiro se a fonte mudasse
-Em Macapá, quebraria o seletor CSS da tabela ou a mudança na regra do `Referer`. No Fortaleza, qualquer alteração no *payload* da API ou a introdução de um captcha real (reCAPTCHA v3) impediria o acesso.
+Em Macapá, qualquer renomeação dos métodos Livewire (`changeYear`/`setMonth`), da chave `tabDiaries` no snapshot ou da política de `Referer`. Em Fortaleza, mudanças no payload de `/api/search` ou exigência de desafio interativo (CAPTCHA) além do WAF atual.
 
-## Qual é a parte mais frágil do seu código e por quê
-O OCR em Macapá. Como os PDFs são fotos do diário impresso, a qualidade do texto depende do escaneamento. O Tesseract pode falhar em páginas rotacionadas ou gerar erros ortográficos leves (ex: "Município" como "Muncípio"). O verificador pega textos vazios, mas não erros ortográficos.
+## Qual é a parte mais frágil do código e por quê
+O OCR de Macapá. Como os PDFs são digitalizações do impresso, páginas tortas, carimbos ou baixa resolução geram ruídos pontuais (ex.: `"Muncípio"` em vez de `"Município"`). O verificador detecta páginas vazias ou muito corrompidas, mas não erros ortográficos sutis que afetam buscas exatas.
 
 ## Como usei IA
-A IA gerou o esqueleto do `requests` e a estrutura base da verificação. Eu precisei intervir em cinco pontos: 1) Adicionar o `Referer` no Macapá; 2) Implementar o *fallback* para OCR; 3) Tratar o "Falso 200" do WAF do Fortaleza; 4) Corrigir o falso positivo de "EXTRATO" com Regex; 5) Migrar o formato de saída de CSV para JSONL para evitar limites de célula e facilitar a indexação.
+Usei IA para estruturar o esqueleto inicial dos coletores, o desempacotamento recursivo do snapshot Livewire v3 e a revisão do verificador. Intervi manualmente para diagnosticar o bloqueio anti-hotlink (`Referer`) de Macapá, limitar o OCR em lotes para evitar estourar memória, tratar o falso HTTP 200 do WAF de Fortaleza, corrigir o falso positivo de "extrato" na classificação de tipos e endurecer as regras de fuso horário e completude no verificador.
